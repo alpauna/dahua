@@ -120,6 +120,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self.events: list = events
         self._supports_coaxial_control = False
         self._supports_disarming_linkage = False
+        self._supports_event_notifications = False
         self._supports_smart_motion_detection = False
         self._supports_lighting = False
         self._supports_floodlightmode = False
@@ -129,6 +130,8 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         self._channel = channel
         self._address = address
         self._max_streams = 3  # 1 main stream + 2 sub-streams by default
+
+        self._supports_lighting_v2 = False
 
         # channel_number is not the channel_index. channel_number is the index + 1.
         # So channel index 0 is channel number 1. Except for some older firmwares where channel
@@ -247,6 +250,13 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     self._supports_disarming_linkage = False
                 _LOGGER.info("Device supports disarming linkage=%s", self._supports_disarming_linkage)
 
+                try:
+                    await self.client.async_get_event_notifications()
+                    self._supports_event_notifications = True
+                except ClientError:
+                    self._supports_event_notifications = False
+                _LOGGER.info("Device supports event notifications=%s", self._supports_event_notifications)
+
                 # Smart motion detection is enabled/disabled/fetched differently on Dahua devices compared to Amcrest
                 # The following lines are for Dahua devices
                 try:
@@ -261,7 +271,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
                 is_flood_light = self.is_flood_light()
                 _LOGGER.info("Device is a floodlight=%s", is_flood_light)
-                
+
                 self._supports_floodlightmode = self.supports_floodlightmode()
 
                 try:
@@ -271,6 +281,16 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     self._supports_lighting = False
                     pass
                 _LOGGER.info("Device supports infrared lighting=%s", self.supports_infrared_light())
+
+#Checking lighting_v2 support
+                try:
+                    await self.client.async_get_lighting_v2()
+                    self._supports_lighting_v2 = True
+                except ClientError:
+                    self._supports_lighting_v2 = False
+                    pass
+                _LOGGER.info("Device supports Lighting_V2=%s", self._supports_lighting_v2)
+
 
                 if not is_doorbell:
                     # Start the event listeners for IP cameras
@@ -320,6 +340,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                     asyncio.ensure_future(self.client.async_get_config_lighting(self._channel, self._profile_mode)))
             if self._supports_disarming_linkage:
                 coros.append(asyncio.ensure_future(self.client.async_get_disarming_linkage()))
+            if self._supports_event_notifications:
                 coros.append(asyncio.ensure_future(self.client.async_get_event_notifications()))
             if self._supports_coaxial_control:
                 coros.append(asyncio.ensure_future(self.client.async_get_coaxial_control_io_status()))
@@ -329,6 +350,9 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
                 coros.append(asyncio.ensure_future(self.client.async_get_video_analyse_rules_for_amcrest()))
             if self.is_amcrest_doorbell():
                 coros.append(asyncio.ensure_future(self.client.async_get_light_global_enabled()))
+            if self._supports_lighting_v2:   #add lighing_v2 API if it is supported
+                coros.append(asyncio.ensure_future(self.client.async_get_lighting_v2()))
+
 
             # Gather results and update the data map
             results = await asyncio.gather(*coros)
@@ -546,7 +570,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """ Returns true if this is a doorbell (VTO) """
         m = self.model.upper()
         return m.startswith("VTO") or m.startswith("DH-VTO") or (
-                "NVR" not in m and m.startswith("DHI")) or self.is_amcrest_doorbell() or self.is_empiretech_doorbell() or self.is_avaloidgoliath_doorbell()
+            "NVR" not in m and m.startswith("DHI")) or self.is_amcrest_doorbell() or self.is_empiretech_doorbell() or self.is_avaloidgoliath_doorbell()
 
     def is_amcrest_doorbell(self) -> bool:
         """ Returns true if this is an Amcrest doorbell """
@@ -572,7 +596,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         """
         if not self._supports_lighting:
             return False
-        return "-AS-PV" not in self.model and "-AS-NI" not in self.model
+        return "-AS-PV" not in self.model and "-AS-NI" not in self.model and "LED-S2" not in self.model     #IPC-HFW2439SP-SA-LED-S2 also has no infrared light
 
     def supports_floodlightmode(self) -> bool:
         """ Returns true if this camera supports floodlight mode """
@@ -583,9 +607,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
         Returns true if this camera has an illuminator (white light for color cameras).  For example, the
         IPC-HDW3849HP-AS-PV does
         """
-        return not (
-                self.is_amcrest_doorbell() or self.is_flood_light()) and "table.Lighting_V2[{0}][0][0].Mode".format(
-            self._channel) in self.data
+        return  not (self.is_amcrest_doorbell() or self.is_flood_light()) and "table.Lighting_V2[{0}][0][0].Mode".format(self._channel) in self.data   
 
     def is_motion_detection_enabled(self) -> bool:
         """ Returns true if motion detection is enabled for the camera """
@@ -642,7 +664,7 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
 
     def is_infrared_light_on(self) -> bool:
         """ returns true if the infrared light is on """
-        return self.data.get("table.Lighting[{0}][0].Mode".format(self._channel), "") == "Manual"
+        return self.data.get("table.Lighting[{0}][0].Mode".format(self._channel),"") == "Manual"
 
     def get_infrared_brightness(self) -> int:
         """Return the brightness of this light, as reported by the camera itself, between 0..255 inclusive"""
@@ -653,14 +675,13 @@ class DahuaDataUpdateCoordinator(DataUpdateCoordinator):
     def is_illuminator_on(self) -> bool:
         """Return true if the illuminator light is on"""
         # profile_mode 0=day, 1=night, 2=scene
-        profile_mode = self.get_profile_mode()
-
+        profile_mode = self.get_profile_mode()       
         return self.data.get("table.Lighting_V2[{0}][{1}][0].Mode".format(self._channel, profile_mode), "") == "Manual"
 
     def is_flood_light_on(self) -> bool:
 
         if self._supports_floodlightmode:
-          #'coaxialControlIO.cgi?action=getStatus&channel=1'
+          # 'coaxialControlIO.cgi?action=getStatus&channel=1'
             return self.data.get("status.status.WhiteLight", "") == "On"
         else:
             """Return true if the amcrest flood light light is on"""
